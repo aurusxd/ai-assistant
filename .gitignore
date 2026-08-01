@@ -1,0 +1,6 @@
+venv/
+.venv/
+.env
+my_account.session
+my_account.session-shm
+my_account.session-wal

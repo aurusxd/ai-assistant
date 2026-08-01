@@ -1,0 +1,13 @@
+[project]
+name = "ai-assistant"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dotenv>=0.9.9",
+    "hydrogram>=0.2.0",
+    "langchain-openai>=1.4.1",
+    "langchain-redis>=0.2.5",
+    "redis>=7.4.1",
+]
