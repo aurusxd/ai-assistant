@@ -21,14 +21,12 @@ services:
       - ./sessions:/app/sessions
 
   redis:
-    image: redis:7.4-alpine
+    image: redis/redis-stack-server:latest
     container_name: ai-assistant-redis
     restart: unless-stopped
 
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
+    environment:
+      REDIS_ARGS: "--appendonly yes"
 
     volumes:
       - redis_data:/data
@@ -38,7 +36,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-      start_period: 5s
+      start_period: 10s
 
 volumes:
   redis_data:
