@@ -21,8 +21,8 @@ services:
     volumes:
       - ./sessions:/app/sessions
 
-  redis:
-    image: redis:7-alpine
+  redis: 
+    image: redis/redis-stack-server:latest
 
     container_name: ai-assistant-redis
 

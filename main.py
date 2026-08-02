@@ -17,7 +17,7 @@ app = Client(
     workdir="/app/sessions",
 )
 
-app.get_me()
+
 
 @app.on_message(filters.text & filters.private)
 async def echo_handler(client, message):
