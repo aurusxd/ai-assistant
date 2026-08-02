@@ -16,15 +16,5 @@ async def echo_handler(client, message):
 
 
 
-async def main() -> None:
-    await app.start()
-
-    try:
-        await idle()
-    finally:
-        await app.stop()
-
-
-
-asyncio.run(main())
-
+if __name__ == "__main__":
+    app.run()
