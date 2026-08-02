@@ -13,5 +13,7 @@ async def main():
             # Формируем ответ и отправляем его
             await message.reply(ask_agent(message.text, message.from_user.id))
 
+        app.run()
+
 
 asyncio.run(main())
