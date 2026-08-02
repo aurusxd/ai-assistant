@@ -1,20 +1,30 @@
 import asyncio
 
-from hydrogram import Client, filters
+from hydrogram import Client, filters, idle
 
 from config import API_HASH, API_ID
 from services.llm_service import ask_agent
 
+app = Client("my_account",API_ID,API_HASH)
 
-async def main():
-    async with Client("my_account", API_ID,API_HASH) as app:
-        @app.on_message(filters.text & filters.private)
-        async def echo_handler(client, message):
-            # Формируем ответ и отправляем его
-            await message.reply(ask_agent(message.text, message.from_user.id))
-
-
-    app.run()
+@app.on_message(filters.text & filters.private)
+async def echo_handler(client, message):
+    if not message.text:
+        return
+    # Формируем ответ и отправляем его
+    await message.reply(await ask_agent(message.text, message.chat.id))
 
 
-asyncio.run(main())
+
+async def main() -> None:
+    await app.start()
+
+    try:
+        await idle()
+    finally:
+        await app.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
