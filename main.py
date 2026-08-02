@@ -14,8 +14,10 @@ app = Client(
     "my_account",
     api_id=API_ID,
     api_hash=API_HASH,
+    workdir="/app/sessions",
 )
 
+app.get_me()
 
 @app.on_message(filters.text & filters.private)
 async def echo_handler(client, message):
