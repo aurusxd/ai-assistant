@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from hydrogram import Client, filters
@@ -19,6 +20,7 @@ app = Client(
 
 
 
+
 @app.on_message(filters.text & filters.private)
 async def echo_handler(client, message):
     logging.info(  # noqa: LOG015
@@ -36,6 +38,7 @@ async def echo_handler(client, message):
             session_id=str(message.chat.id),
         )
 
+        await asyncio.sleep(3)
         await message.reply_text(answer)
 
     except Exception:
