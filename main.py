@@ -21,7 +21,7 @@ app = Client(
 
 
 
-@app.on_message(filters.text & filters.private)
+@app.on_message(filters.text & filters.private & ~filters.bot)
 async def echo_handler(client, message):
     logging.info(  # noqa: LOG015
         "Получено сообщение: chat_id=%s, text=%r",
