@@ -20,7 +20,20 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-app = Client(
+class UserbotClient(Client):
+    """Аккаунт, в который можно войти через бота управления, а не через консоль."""
+
+    login_handler = None
+
+    async def authorize(self):
+        # Hydrogram вызывает authorize() из start(), только если сессии ещё нет.
+        if self.login_handler is None:
+            return await super().authorize()
+
+        return await self.login_handler(self)
+
+
+app = UserbotClient(
     "my_account",
     api_id=API_ID,
     api_hash=API_HASH,
@@ -148,16 +161,11 @@ async def message_handler(
 
 
 async def main() -> None:
-    await app.start()
-
-    me = await app.get_me()
-    logging.info("Аккаунт запущен: %s, id=%s", me.first_name, me.id)
-
     control_bot = None
 
+    # Бот поднимается раньше аккаунта, чтобы через него можно было войти.
     if BOT_TOKEN:
-        # Владелец аккаунта всегда может управлять ботом.
-        control_bot = ControlBot(userbot=app, admin_ids={me.id, *ADMIN_IDS})
+        control_bot = ControlBot(userbot=app, admin_ids=set(ADMIN_IDS))
 
         try:
             await control_bot.start()
@@ -167,10 +175,21 @@ async def main() -> None:
                 "Не удалось запустить бота управления, проверь BOT_TOKEN"
             )
             control_bot = None
+        else:
+            app.login_handler = control_bot.login_userbot
     else:
         logging.warning(
             "BOT_TOKEN не задан — бот управления не запущен"
         )
+
+    await app.start()
+
+    me = await app.get_me()
+    logging.info("Аккаунт запущен: %s, id=%s", me.first_name, me.id)
+
+    if control_bot:
+        # Владелец аккаунта всегда может управлять ботом.
+        control_bot.admin_ids.add(me.id)
 
     await idle()
 

@@ -4,20 +4,32 @@
 Через него можно включать/выключать автоответы, менять промпт
 (то, как программа общается за тебя), задержку, креативность,
 списки собеседников и сбрасывать историю диалогов.
+Здесь же выполняется вход в Telegram-аккаунт, если сессии ещё нет.
 """
 
+import asyncio
 import logging
 from html import escape
 
 from hydrogram import Client, filters
 from hydrogram.enums import ParseMode
-from hydrogram.errors import MessageNotModified
+from hydrogram.errors import (
+    FloodWait,
+    MessageNotModified,
+    PasswordHashInvalid,
+    PhoneCodeEmpty,
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    RPCError,
+    SessionPasswordNeeded,
+)
 from hydrogram.handlers import CallbackQueryHandler, MessageHandler
 from hydrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    User,
 )
 
 from config import API_HASH, API_ID, BOT_TOKEN
@@ -41,7 +53,7 @@ TEMPERATURE_PRESETS = (0.2, 0.5, 0.7, 1.0, 1.3)
 
 COMMANDS = [
     "start", "menu", "status", "help", "on", "off", "prompt", "cancel",
-    "reset", "ignore", "allow", "unignore", "disallow",
+    "reset", "ignore", "allow", "unignore", "disallow", "login",
 ]
 
 LISTS = {
@@ -61,6 +73,7 @@ HELP_TEXT = """
 /allow <i>@username или id</i> — добавить в белый список
 /disallow <i>@username или id</i> — убрать из белого списка
 /reset [<i>@username или id</i>] — сбросить историю диалога (без аргумента — всех)
+/login — войти в Telegram-аккаунт (нужно только при первом запуске)
 /cancel — отменить ввод
 
 Длинный промпт можно прислать .txt файлом, когда бот попросит новый промпт.
@@ -84,7 +97,13 @@ class ControlBot:
 
         # Чего бот ждёт от админа следующим сообщением:
         # admin_id -> "prompt" | "delay" | "reset" | "add:ignored" | "add:allowed"
+        #             | "login:phone" | "login:code" | "login:password"
         self.pending: dict[int, str] = {}
+
+        # Пока аккаунт не авторизован, userbot ждёт этот future.
+        self.login_future: asyncio.Future[User] | None = None
+        self.login_phone = ""
+        self.login_code_hash = ""
 
         self.client = Client(
             "control_bot",
@@ -117,6 +136,7 @@ class ControlBot:
             (self.cmd_reset, filters.command("reset")),
             (self.cmd_list_add, filters.command(["ignore", "allow"])),
             (self.cmd_list_remove, filters.command(["unignore", "disallow"])),
+            (self.cmd_login, filters.command("login")),
             (
                 self.on_input,
                 (filters.text & ~filters.command(COMMANDS)) | filters.document,
@@ -137,7 +157,39 @@ class ControlBot:
         logger.info("Бот управления запущен: @%s", me.username)
 
     async def stop(self) -> None:
+        if self.login_required:
+            self.login_future.cancel()
+
         await self.client.stop()
+
+    @property
+    def login_required(self) -> bool:
+        return bool(self.login_future and not self.login_future.done())
+
+    async def login_userbot(self, _: Client) -> User:
+        """Вместо ввода в консоли ждёт, пока админ войдёт в аккаунт через бота."""
+        self.login_future = asyncio.get_running_loop().create_future()
+
+        if not self.admin_ids:
+            logger.error(
+                "Аккаунт не авторизован, а войти через бота некому: "
+                "добавь свой Telegram id в ADMIN_IDS в .env и перезапусти"
+            )
+        else:
+            logger.warning("Аккаунт не авторизован — жду входа через бота: /login")
+
+        for admin_id in self.admin_ids:
+            try:
+                await self.client.send_message(
+                    admin_id,
+                    "🔐 Аккаунт Telegram не авторизован, автоответчик не работает.\n"
+                    "Нажми /login, чтобы войти.",
+                )
+            except Exception:
+                # Бот не может написать первым, пока ему не нажали /start.
+                logger.warning("Не удалось написать админу %s", admin_id)
+
+        return await self.login_future
 
     # region Экраны
 
@@ -160,6 +212,9 @@ class ControlBot:
             f"Голосовые: {_yes_no(settings.voice_enabled)}\n"
             f"Промпт: {len(settings.system_prompt)} символов"
         )
+
+        if self.login_required:
+            text = "🔐 <b>Аккаунт не авторизован</b> — войди: /login\n\n" + text
 
         keyboard = InlineKeyboardMarkup(
             [
@@ -407,6 +462,17 @@ class ControlBot:
         await settings_service.remove_from_list(key, chat_id)
         await message.reply_text(f"Убрал из списка «{title}»")
 
+    async def cmd_login(self, _: Client, message: Message) -> None:
+        if not self.login_required:
+            await message.reply_text("✅ Аккаунт уже авторизован")
+            return
+
+        self.pending[message.from_user.id] = "login:phone"
+        await message.reply_text(
+            "📱 Пришли номер телефона аккаунта в международном формате, "
+            "например +79991234567\n\n/cancel — отмена"
+        )
+
     # endregion
 
     # region Ввод значений
@@ -421,6 +487,10 @@ class ControlBot:
         if not action:
             text, keyboard = await self.main_screen()
             await message.reply_text(text, reply_markup=keyboard)
+            return
+
+        if action.startswith("login:"):
+            await self._login_step(message, action.removeprefix("login:"))
             return
 
         if action == "prompt":
@@ -498,6 +568,120 @@ class ControlBot:
         await message.reply_text(
             f"✅ Промпт обновлён ({len(new_prompt)} символов).\n"
             "Если старые диалоги мешают новому стилю — сбрось историю: /reset"
+        )
+
+    # endregion
+
+    # region Вход в аккаунт
+
+    async def _login_step(self, message: Message, step: str) -> None:
+        user_id = message.from_user.id
+
+        if not self.login_required:
+            self.pending.pop(user_id, None)
+            await message.reply_text("✅ Аккаунт уже авторизован")
+            return
+
+        if not message.text:
+            await message.reply_text("Пришли текстом или /cancel")
+            return
+
+        value = message.text.strip()
+
+        if step != "phone":
+            # Код и пароль не должны оставаться в переписке.
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+        userbot = self.userbot
+
+        try:
+            if step == "phone":
+                phone = "+" + "".join(ch for ch in value if ch.isdigit())
+                sent_code = await userbot.send_code(phone)
+
+                self.login_phone = phone
+                self.login_code_hash = sent_code.phone_code_hash
+                self.pending[user_id] = "login:code"
+
+                await message.reply_text(
+                    "✉️ Код отправлен в Telegram (или по SMS).\n\n"
+                    "Пришли его <b>с пробелами между цифрами</b>, например "
+                    "<code>1 2 3 4 5</code>. Если прислать код как есть, "
+                    "Telegram заметит его в переписке и сразу аннулирует.\n\n"
+                    "/cancel — отмена"
+                )
+                return
+
+            if step == "code":
+                code = "".join(ch for ch in value if ch.isdigit())
+
+                try:
+                    user = await userbot.sign_in(
+                        self.login_phone, self.login_code_hash, code
+                    )
+                except SessionPasswordNeeded:
+                    self.pending[user_id] = "login:password"
+                    hint = await userbot.get_password_hint()
+                    await message.reply_text(
+                        "🔑 Включена двухэтапная аутентификация. Пришли облачный "
+                        "пароль — сообщение с ним я сразу удалю."
+                        + (f"\n\nПодсказка: {escape(hint)}" if hint else "")
+                        + "\n\n/cancel — отмена"
+                    )
+                    return
+
+                if not isinstance(user, User):
+                    self.pending.pop(user_id, None)
+                    await message.reply_text(
+                        "На этот номер не зарегистрирован аккаунт Telegram. "
+                        "Попробуй другой номер: /login"
+                    )
+                    return
+
+            else:
+                user = await userbot.check_password(value)
+
+        except (PhoneCodeInvalid, PhoneCodeEmpty):
+            await message.reply_text("Неверный код, пришли ещё раз. Или /cancel")
+            return
+        except PhoneCodeExpired:
+            self.pending.pop(user_id, None)
+            await message.reply_text("Код устарел. Начни заново: /login")
+            return
+        except PasswordHashInvalid:
+            await message.reply_text("Неверный пароль, пришли ещё раз. Или /cancel")
+            return
+        except FloodWait as exc:
+            self.pending.pop(user_id, None)
+            await message.reply_text(
+                f"Telegram просит подождать {exc.value} сек перед новой попыткой"
+            )
+            return
+        except RPCError as exc:
+            logger.warning("Ошибка входа в аккаунт: %s", exc)
+            reason = escape(exc.MESSAGE or str(exc))
+
+            if step == "phone":
+                await message.reply_text(
+                    f"Не получилось отправить код: {reason}\n"
+                    "Проверь номер и пришли ещё раз. Или /cancel"
+                )
+            else:
+                self.pending.pop(user_id, None)
+                await message.reply_text(
+                    f"Не получилось войти: {reason}\nНачни заново: /login"
+                )
+            return
+
+        self.pending.pop(user_id, None)
+        self.login_future.set_result(user)
+
+        await message.reply_text(
+            f"✅ Вход выполнен: {escape(user.first_name or str(user.id))}. "
+            "Автоответчик запускается. /menu"
         )
 
     # endregion
@@ -615,7 +799,11 @@ class ControlBot:
             "Попытка доступа к боту управления: user_id=%s",
             message.from_user.id if message.from_user else None,
         )
-        await message.reply_text("⛔️ Нет доступа")
+        # id нужен, чтобы владелец мог прописать себя в ADMIN_IDS.
+        await message.reply_text(
+            "⛔️ Нет доступа\n\n"
+            f"Твой id: <code>{message.from_user.id if message.from_user else '?'}</code>"
+        )
 
     # region Вспомогательное
 
