@@ -12,7 +12,7 @@ import logging
 from html import escape
 
 from hydrogram import Client, filters
-from hydrogram.enums import ParseMode
+from hydrogram.enums import NextCodeType, ParseMode, SentCodeType
 from hydrogram.errors import (
     FloodWait,
     MessageNotModified,
@@ -29,6 +29,7 @@ from hydrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    SentCode,
     User,
 )
 
@@ -53,8 +54,32 @@ TEMPERATURE_PRESETS = (0.2, 0.5, 0.7, 1.0, 1.3)
 
 COMMANDS = [
     "start", "menu", "status", "help", "on", "off", "prompt", "cancel",
-    "reset", "ignore", "allow", "unignore", "disallow", "login",
+    "reset", "ignore", "allow", "unignore", "disallow", "login", "resend",
 ]
+
+# Куда Telegram отправил код входа.
+SENT_CODE_PLACES = {
+    SentCodeType.APP: (
+        "в приложение Telegram: ищи сообщение в чате «Telegram» с синей "
+        "галочкой на телефоне или компьютере, где этот аккаунт уже открыт. "
+        "По SMS он не придёт"
+    ),
+    SentCodeType.SMS: "по SMS",
+    SentCodeType.FRAGMENT_SMS: "по SMS через Fragment",
+    SentCodeType.CALL: "звонком — код продиктуют",
+    SentCodeType.FLASH_CALL: "звонком — код это последние цифры входящего номера",
+    SentCodeType.MISSED_CALL: "пропущенным звонком — код это последние цифры номера",
+    SentCodeType.EMAIL_CODE: "на почту, привязанную к аккаунту",
+}
+
+# Как Telegram может отправить код повторно.
+NEXT_CODE_WAYS = {
+    NextCodeType.SMS: "по SMS",
+    NextCodeType.FRAGMENT_SMS: "по SMS через Fragment",
+    NextCodeType.CALL: "звонком",
+    NextCodeType.FLASH_CALL: "звонком",
+    NextCodeType.MISSED_CALL: "пропущенным звонком",
+}
 
 LISTS = {
     "ignored": (IGNORED_KEY, "Чёрный список"),
@@ -74,6 +99,7 @@ HELP_TEXT = """
 /disallow <i>@username или id</i> — убрать из белого списка
 /reset [<i>@username или id</i>] — сбросить историю диалога (без аргумента — всех)
 /login — войти в Telegram-аккаунт (нужно только при первом запуске)
+/resend — отправить код входа ещё раз другим способом
 /cancel — отменить ввод
 
 Длинный промпт можно прислать .txt файлом, когда бот попросит новый промпт.
@@ -126,7 +152,10 @@ class ControlBot:
             ),
             name="IsAdmin",
         )
-        admin_private = filters.private & is_admin
+        # Бот получает и свои исходящие сообщения: без incoming он принимал
+        # их за чужие и отвечал сам себе «Нет доступа».
+        private = filters.private & filters.incoming
+        admin_private = private & is_admin
 
         # Hydrogram вызывает все подходящие обработчики, а не только первый,
         # поэтому фильтры не должны пересекаться.
@@ -141,6 +170,7 @@ class ControlBot:
             (self.cmd_list_add, filters.command(["ignore", "allow"])),
             (self.cmd_list_remove, filters.command(["unignore", "disallow"])),
             (self.cmd_login, filters.command("login")),
+            (self.cmd_resend, filters.command("resend")),
             (
                 self.on_input,
                 (filters.text & ~filters.command(COMMANDS)) | filters.document,
@@ -151,7 +181,7 @@ class ControlBot:
             self.client.add_handler(MessageHandler(callback, admin_private & flt))
 
         self.client.add_handler(
-            MessageHandler(self.on_stranger, filters.private & ~is_admin)
+            MessageHandler(self.on_stranger, private & ~is_admin)
         )
         self.client.add_handler(CallbackQueryHandler(self.on_callback, is_admin))
 
@@ -483,6 +513,40 @@ class ControlBot:
             "например +79991234567\n\n/cancel — отмена"
         )
 
+    async def cmd_resend(self, _: Client, message: Message) -> None:
+        user_id = message.from_user.id
+        logger.info("Вход: /resend от %s", user_id)
+
+        if not self.login_required:
+            await message.reply_text("✅ Аккаунт уже авторизован")
+            return
+
+        if self.pending.get(user_id) != "login:code":
+            await message.reply_text("Сначала запроси код: /login")
+            return
+
+        try:
+            sent_code = await self.userbot.resend_code(
+                self.login_phone, self.login_code_hash
+            )
+        except FloodWait as exc:
+            logger.warning("Вход: FloodWait на %s сек при повторной отправке", exc.value)
+            await message.reply_text(
+                f"Telegram просит подождать {exc.value} сек перед новой попыткой"
+            )
+            return
+        except RPCError as exc:
+            logger.warning("Вход: не удалось отправить код повторно: %s", exc)
+            await message.reply_text(
+                "Telegram не отправил код повторно: "
+                f"{escape(exc.MESSAGE or str(exc))}\n"
+                "Можно начать заново: /login"
+            )
+            return
+
+        self.login_code_hash = sent_code.phone_code_hash
+        await message.reply_text(self._code_sent_text(sent_code))
+
     # endregion
 
     # region Ввод значений
@@ -625,15 +689,8 @@ class ControlBot:
                 self.login_phone = phone
                 self.login_code_hash = sent_code.phone_code_hash
                 self.pending[user_id] = "login:code"
-                logger.info("Вход: код отправлен, способ: %s", sent_code.type)
 
-                await message.reply_text(
-                    "✉️ Код отправлен в Telegram (или по SMS).\n\n"
-                    "Пришли его <b>с пробелами между цифрами</b>, например "
-                    "<code>1 2 3 4 5</code>. Если прислать код как есть, "
-                    "Telegram заметит его в переписке и сразу аннулирует.\n\n"
-                    "/cancel — отмена"
-                )
+                await message.reply_text(self._code_sent_text(sent_code))
                 return
 
             if step == "code":
@@ -716,6 +773,30 @@ class ControlBot:
             f"✅ Вход выполнен: {escape(user.first_name or str(user.id))}. "
             "Автоответчик запускается. /menu"
         )
+
+    @staticmethod
+    def _code_sent_text(sent_code: SentCode) -> str:
+        logger.info(
+            "Вход: код отправлен, способ: %s, повторно можно: %s, через %s сек",
+            sent_code.type,
+            sent_code.next_type,
+            sent_code.timeout,
+        )
+
+        place = SENT_CODE_PLACES.get(sent_code.type, "в Telegram")
+        text = (
+            f"✉️ Код отправлен {place}.\n\n"
+            "Пришли его <b>с пробелами между цифрами</b>, например "
+            "<code>1 2 3 4 5</code>. Если прислать код как есть, "
+            "Telegram заметит его в переписке и сразу аннулирует."
+        )
+
+        next_way = NEXT_CODE_WAYS.get(sent_code.next_type)
+        if next_way:
+            wait = f" через {sent_code.timeout} сек" if sent_code.timeout else ""
+            text += f"\n\nНе пришёл? Отправлю {next_way}{wait}: /resend"
+
+        return text + "\n\n/cancel — отмена"
 
     # endregion
 
