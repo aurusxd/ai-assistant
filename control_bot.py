@@ -134,6 +134,8 @@ class ControlBot:
         self.login_future: asyncio.Future[User] | None = None
         self.login_phone = ""
         self.login_code_hash = ""
+        # Каким способом Telegram может прислать код повторно (None — никаким).
+        self.login_next_type: NextCodeType | None = None
 
         self.client = Client(
             "control_bot",
@@ -525,6 +527,17 @@ class ControlBot:
             await message.reply_text("Сначала запроси код: /login")
             return
 
+        if self.login_next_type is None:
+            # Иначе Telegram отвечает SEND_CODE_UNAVAILABLE.
+            logger.info("Вход: Telegram не предлагает другого способа отправки")
+            await message.reply_text(
+                "Telegram не даёт отправить код другим способом: для этого "
+                "номера он приходит только в приложение Telegram, в чат "
+                "«Telegram» с синей галочкой.\n\n"
+                "Если кода там нет, подожди и запроси новый: /login"
+            )
+            return
+
         try:
             sent_code = await self.userbot.resend_code(
                 self.login_phone, self.login_code_hash
@@ -535,16 +548,21 @@ class ControlBot:
                 f"Telegram просит подождать {exc.value} сек перед новой попыткой"
             )
             return
-        except RPCError as exc:
-            logger.warning("Вход: не удалось отправить код повторно: %s", exc)
+        except Exception as exc:
+            # Hydrogram 0.2.0 знает не все ошибки Telegram и на незнакомых
+            # падает с AttributeError вместо RPCError.
+            logger.warning("Вход: не удалось отправить код повторно: %r", exc)
+            reason = (
+                exc.MESSAGE if isinstance(exc, RPCError) else "подробности в логах"
+            )
             await message.reply_text(
-                "Telegram не отправил код повторно: "
-                f"{escape(exc.MESSAGE or str(exc))}\n"
+                f"Telegram не отправил код повторно: {escape(reason)}\n"
                 "Можно начать заново: /login"
             )
             return
 
         self.login_code_hash = sent_code.phone_code_hash
+        self.login_next_type = sent_code.next_type
         await message.reply_text(self._code_sent_text(sent_code))
 
     # endregion
@@ -688,6 +706,7 @@ class ControlBot:
 
                 self.login_phone = phone
                 self.login_code_hash = sent_code.phone_code_hash
+                self.login_next_type = sent_code.next_type
                 self.pending[user_id] = "login:code"
 
                 await message.reply_text(self._code_sent_text(sent_code))
