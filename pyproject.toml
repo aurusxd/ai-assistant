@@ -11,4 +11,5 @@ dependencies = [
     "langchain-openai>=1.4.1",
     "langchain-redis>=0.2.5",
     "redis>=7.4.1",
+    "segno>=1.6.6",
 ]

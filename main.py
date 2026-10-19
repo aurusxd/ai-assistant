@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from hydrogram import Client, filters, idle
+from hydrogram import Client, filters, idle, raw
 from hydrogram.types import Message
 
 from config import ADMIN_IDS, API_HASH, API_ID, BOT_TOKEN
@@ -24,6 +24,8 @@ class UserbotClient(Client):
     """Аккаунт, в который можно войти через бота управления, а не через консоль."""
 
     login_handler = None
+    # Вызывается, когда QR-код для входа отсканировали на другом устройстве.
+    login_token_handler = None
 
     async def authorize(self):
         # Hydrogram вызывает authorize() из start(), только если сессии ещё нет.
@@ -31,6 +33,18 @@ class UserbotClient(Client):
             return await super().authorize()
 
         return await self.login_handler(self)
+
+    async def handle_updates(self, updates):
+        # До входа обработчики Hydrogram ещё не запущены, поэтому
+        # UpdateLoginToken ловим здесь, сразу как он пришёл.
+        if (
+            self.login_token_handler
+            and isinstance(updates, raw.types.UpdateShort)
+            and isinstance(updates.update, raw.types.UpdateLoginToken)
+        ):
+            self.login_token_handler()
+
+        return await super().handle_updates(updates)
 
 
 app = UserbotClient(
@@ -177,6 +191,7 @@ async def main() -> None:
             control_bot = None
         else:
             app.login_handler = control_bot.login_userbot
+            app.login_token_handler = control_bot.on_login_token
     else:
         logging.warning(
             "BOT_TOKEN не задан — бот управления не запущен"

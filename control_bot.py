@@ -8,10 +8,14 @@
 """
 
 import asyncio
+import base64
+import io
 import logging
+import time
 from html import escape
 
-from hydrogram import Client, filters
+import segno
+from hydrogram import Client, filters, raw, types
 from hydrogram.enums import NextCodeType, ParseMode, SentCodeType
 from hydrogram.errors import (
     FloodWait,
@@ -24,6 +28,7 @@ from hydrogram.errors import (
     SessionPasswordNeeded,
 )
 from hydrogram.handlers import CallbackQueryHandler, MessageHandler
+from hydrogram.session import Auth, Session
 from hydrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -46,6 +51,8 @@ from services.settings_service import (
 logger = logging.getLogger(__name__)
 
 PROMPT_PREVIEW_LIMIT = 3500
+# Сколько секунд показывать QR-коды для входа, пока их не отсканируют.
+QR_LOGIN_TIMEOUT = 300
 MAX_PROMPT_LENGTH = 20000
 MAX_REPLY_DELAY = 60
 
@@ -98,7 +105,7 @@ HELP_TEXT = """
 /allow <i>@username или id</i> — добавить в белый список
 /disallow <i>@username или id</i> — убрать из белого списка
 /reset [<i>@username или id</i>] — сбросить историю диалога (без аргумента — всех)
-/login — войти в Telegram-аккаунт (нужно только при первом запуске)
+/login — войти в Telegram-аккаунт по QR-коду или номеру (нужно только при первом запуске)
 /resend — отправить код входа ещё раз другим способом
 /cancel — отменить ввод
 
@@ -136,6 +143,10 @@ class ControlBot:
         self.login_code_hash = ""
         # Каким способом Telegram может прислать код повторно (None — никаким).
         self.login_next_type: NextCodeType | None = None
+
+        # Вход по QR-коду: фоновая задача и сигнал, что код отсканировали.
+        self.qr_task: asyncio.Task | None = None
+        self.qr_scanned = asyncio.Event()
 
         self.client = Client(
             "control_bot",
@@ -193,6 +204,8 @@ class ControlBot:
         logger.info("Бот управления запущен: @%s", me.username)
 
     async def stop(self) -> None:
+        self._cancel_qr_login()
+
         if self.login_required:
             self.login_future.cancel()
 
@@ -452,7 +465,9 @@ class ControlBot:
         await self._save_prompt(message, new_prompt)
 
     async def cmd_cancel(self, _: Client, message: Message) -> None:
-        if self.pending.pop(message.from_user.id, None):
+        qr_cancelled = self._cancel_qr_login()
+
+        if self.pending.pop(message.from_user.id, None) or qr_cancelled:
             await message.reply_text("Отменено")
         else:
             await message.reply_text("Нечего отменять")
@@ -509,10 +524,23 @@ class ControlBot:
             await message.reply_text("✅ Аккаунт уже авторизован")
             return
 
-        self.pending[message.from_user.id] = "login:phone"
+        self.pending.pop(message.from_user.id, None)
         await message.reply_text(
-            "📱 Пришли номер телефона аккаунта в международном формате, "
-            "например +79991234567\n\n/cancel — отмена"
+            "🔐 <b>Как войти в аккаунт?</b>\n\n"
+            "📷 <b>По QR-коду</b> — код из Telegram не нужен. Отсканируй QR "
+            "в Telegram на телефоне, где этот аккаунт уже открыт: "
+            "Настройки → Устройства → Подключить устройство.\n\n"
+            "📱 <b>По номеру телефона</b> — Telegram пришлёт код.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("📷 По QR-коду", callback_data="login:qr"),
+                        InlineKeyboardButton(
+                            "📱 По номеру", callback_data="login:phone"
+                        ),
+                    ]
+                ]
+            ),
         )
 
     async def cmd_resend(self, _: Client, message: Message) -> None:
@@ -722,14 +750,7 @@ class ControlBot:
                     )
                 except SessionPasswordNeeded:
                     logger.info("Вход: код принят, нужен облачный пароль")
-                    self.pending[user_id] = "login:password"
-                    hint = await userbot.get_password_hint()
-                    await message.reply_text(
-                        "🔑 Включена двухэтапная аутентификация. Пришли облачный "
-                        "пароль — сообщение с ним я сразу удалю."
-                        + (f"\n\nПодсказка: {escape(hint)}" if hint else "")
-                        + "\n\n/cancel — отмена"
-                    )
+                    await self._ask_password(user_id)
                     return
 
                 if not isinstance(user, User):
@@ -784,14 +805,188 @@ class ControlBot:
                 )
             return
 
+        await self._finish_login(user_id, user)
+
+    async def _ask_password(self, user_id: int) -> None:
+        self.pending[user_id] = "login:password"
+        hint = await self.userbot.get_password_hint()
+        await self.client.send_message(
+            user_id,
+            "🔑 Включена двухэтапная аутентификация. Пришли облачный "
+            "пароль — сообщение с ним я сразу удалю."
+            + (f"\n\nПодсказка: {escape(hint)}" if hint else "")
+            + "\n\n/cancel — отмена",
+        )
+
+    async def _finish_login(self, user_id: int, user: User) -> None:
         logger.info("Вход: успешно, аккаунт id=%s", user.id)
         self.pending.pop(user_id, None)
+        self._cancel_qr_login()
         self.login_future.set_result(user)
 
-        await message.reply_text(
+        await self.client.send_message(
+            user_id,
             f"✅ Вход выполнен: {escape(user.first_name or str(user.id))}. "
-            "Автоответчик запускается. /menu"
+            "Автоответчик запускается. /menu",
         )
+
+    async def _choose_login(self, query: CallbackQuery, method: str) -> None:
+        user_id = query.from_user.id
+        logger.info("Вход: выбран способ %s, от %s", method, user_id)
+        await query.answer()
+
+        if not self.login_required:
+            await query.message.reply_text("✅ Аккаунт уже авторизован")
+            return
+
+        if method == "phone":
+            self._cancel_qr_login()
+            self.pending[user_id] = "login:phone"
+            await query.message.reply_text(
+                "📱 Пришли номер телефона аккаунта в международном формате, "
+                "например +79991234567\n\n/cancel — отмена"
+            )
+        elif method == "qr":
+            self._cancel_qr_login()
+            self.pending.pop(user_id, None)
+            self.qr_task = asyncio.create_task(self._qr_login(user_id))
+
+    # region Вход по QR-коду
+
+    def on_login_token(self) -> None:
+        """Userbot вызывает его, когда QR-код отсканировали."""
+        if self.qr_task and not self.qr_task.done():
+            logger.info("Вход: QR-код отсканирован")
+            self.qr_scanned.set()
+
+    def _cancel_qr_login(self) -> bool:
+        task = self.qr_task
+        if not task or task.done() or task is asyncio.current_task():
+            return False
+
+        task.cancel()
+        return True
+
+    async def _qr_login(self, user_id: int) -> None:
+        userbot = self.userbot
+        qr_message: Message | None = None
+        deadline = time.monotonic() + QR_LOGIN_TIMEOUT
+        logger.info("Вход: показываю QR-код")
+
+        try:
+            while time.monotonic() < deadline:
+                self.qr_scanned.clear()
+
+                # Пока код не отсканировали, Telegram выдаёт новый токен,
+                # а после сканирования — результат входа.
+                result = await userbot.invoke(
+                    raw.functions.auth.ExportLoginToken(
+                        api_id=userbot.api_id,
+                        api_hash=userbot.api_hash,
+                        except_ids=[],
+                    )
+                )
+
+                if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
+                    result = await self._import_login_token(result)
+
+                if isinstance(result, raw.types.auth.LoginTokenSuccess):
+                    user = await self._save_login(result.authorization.user)
+                    await self._finish_login(user_id, user)
+                    return
+
+                new_message = await self.client.send_photo(
+                    user_id,
+                    self._qr_image(result.token),
+                    caption=(
+                        "📷 Открой Telegram на телефоне, где этот аккаунт уже "
+                        "открыт: Настройки → Устройства → Подключить устройство, "
+                        "и наведи камеру на этот QR-код.\n\n"
+                        "Код обновляется каждые полминуты. /cancel — отмена"
+                    ),
+                )
+                await self._delete_message(qr_message)
+                qr_message = new_message
+
+                # Токен живёт около 30 секунд: ждём сканирования или истечения.
+                lifetime = min(max(result.expires - time.time(), 5), 60)
+                try:
+                    await asyncio.wait_for(self.qr_scanned.wait(), lifetime)
+                except TimeoutError:
+                    pass
+
+            logger.info("Вход: QR-код так и не отсканировали")
+            await self.client.send_message(
+                user_id, "⌛️ QR-код так и не отсканировали. Попробуй ещё раз: /login"
+            )
+
+        except SessionPasswordNeeded:
+            logger.info("Вход: QR-код отсканирован, нужен облачный пароль")
+            await self._ask_password(user_id)
+        except asyncio.CancelledError:
+            logger.info("Вход: показ QR-кода остановлен")
+            raise
+        except Exception:
+            logger.exception("Вход: не получилось войти по QR-коду")
+            await self.client.send_message(
+                user_id,
+                "Не получилось войти по QR-коду, подробности в логах. "
+                "Попробуй ещё раз или войди по номеру: /login",
+            )
+        finally:
+            await self._delete_message(qr_message)
+
+    async def _import_login_token(
+        self, result: raw.types.auth.LoginTokenMigrateTo
+    ) -> raw.base.auth.LoginToken:
+        """Аккаунт живёт в другом дата-центре: переключаемся туда, как send_code."""
+        userbot = self.userbot
+        logger.info("Вход: аккаунт в DC%s, переключаюсь", result.dc_id)
+
+        await userbot.session.stop()
+
+        await userbot.storage.dc_id(result.dc_id)
+        await userbot.storage.auth_key(
+            await Auth(userbot, result.dc_id, await userbot.storage.test_mode()).create()
+        )
+        userbot.session = Session(
+            userbot,
+            result.dc_id,
+            await userbot.storage.auth_key(),
+            await userbot.storage.test_mode(),
+        )
+        await userbot.session.start()
+
+        return await userbot.invoke(
+            raw.functions.auth.ImportLoginToken(token=result.token)
+        )
+
+    async def _save_login(self, raw_user: raw.base.User) -> User:
+        # То же, что делает sign_in после успешного входа.
+        await self.userbot.storage.user_id(raw_user.id)
+        await self.userbot.storage.is_bot(False)
+        return types.User._parse(self.userbot, raw_user)
+
+    @staticmethod
+    def _qr_image(token: bytes) -> io.BytesIO:
+        url = "tg://login?token=" + base64.urlsafe_b64encode(token).decode()
+
+        image = io.BytesIO()
+        segno.make(url, error="m").save(image, kind="png", scale=10, border=4)
+        image.name = "login_qr.png"
+        image.seek(0)
+        return image
+
+    async def _delete_message(self, message: Message | None) -> None:
+        if not message:
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            logger.warning("Вход: не удалось удалить старый QR-код")
+
+    # endregion
 
     @staticmethod
     def _code_sent_text(sent_code: SentCode) -> str:
@@ -828,6 +1023,10 @@ class ControlBot:
 
         if data.startswith("ask:"):
             await self._ask(query, data.removeprefix("ask:"))
+            return
+
+        if data.startswith("login:"):
+            await self._choose_login(query, data.removeprefix("login:"))
             return
 
         # Любая кнопка, кроме запроса ввода, отменяет ожидание ввода.
