@@ -84,6 +84,10 @@ def _yes_no(value: bool) -> str:
     return "вкл" if value else "выкл"
 
 
+def _mask_phone(phone: str) -> str:
+    return f"{phone[:3]}***{phone[-2:]}"
+
+
 def _back_button(target: str = "menu") -> list[InlineKeyboardButton]:
     return [InlineKeyboardButton("⬅️ Назад", callback_data=target)]
 
@@ -463,6 +467,12 @@ class ControlBot:
         await message.reply_text(f"Убрал из списка «{title}»")
 
     async def cmd_login(self, _: Client, message: Message) -> None:
+        logger.info(
+            "Вход: /login от %s, аккаунт ждёт входа: %s",
+            message.from_user.id,
+            self.login_required,
+        )
+
         if not self.login_required:
             await message.reply_text("✅ Аккаунт уже авторизован")
             return
@@ -485,6 +495,13 @@ class ControlBot:
             return
 
         if not action:
+            if self.login_required:
+                logger.info(
+                    "Вход: сообщение от %s без активного шага входа, "
+                    "показываю меню",
+                    message.from_user.id,
+                )
+
             text, keyboard = await self.main_screen()
             await message.reply_text(text, reply_markup=keyboard)
             return
@@ -576,6 +593,8 @@ class ControlBot:
 
     async def _login_step(self, message: Message, step: str) -> None:
         user_id = message.from_user.id
+        # Сам код и пароль в лог не пишем — только шаг и исход.
+        logger.info("Вход: шаг %s, сообщение от %s", step, user_id)
 
         if not self.login_required:
             self.pending.pop(user_id, None)
@@ -593,18 +612,20 @@ class ControlBot:
             try:
                 await message.delete()
             except Exception:
-                pass
+                logger.warning("Вход: не удалось удалить сообщение с шага %s", step)
 
         userbot = self.userbot
 
         try:
             if step == "phone":
                 phone = "+" + "".join(ch for ch in value if ch.isdigit())
+                logger.info("Вход: отправляю код на %s", _mask_phone(phone))
                 sent_code = await userbot.send_code(phone)
 
                 self.login_phone = phone
                 self.login_code_hash = sent_code.phone_code_hash
                 self.pending[user_id] = "login:code"
+                logger.info("Вход: код отправлен, способ: %s", sent_code.type)
 
                 await message.reply_text(
                     "✉️ Код отправлен в Telegram (или по SMS).\n\n"
@@ -617,12 +638,14 @@ class ControlBot:
 
             if step == "code":
                 code = "".join(ch for ch in value if ch.isdigit())
+                logger.info("Вход: проверяю код (%s цифр)", len(code))
 
                 try:
                     user = await userbot.sign_in(
                         self.login_phone, self.login_code_hash, code
                     )
                 except SessionPasswordNeeded:
+                    logger.info("Вход: код принят, нужен облачный пароль")
                     self.pending[user_id] = "login:password"
                     hint = await userbot.get_password_hint()
                     await message.reply_text(
@@ -634,6 +657,7 @@ class ControlBot:
                     return
 
                 if not isinstance(user, User):
+                    logger.warning("Вход: на номер не зарегистрирован аккаунт")
                     self.pending.pop(user_id, None)
                     await message.reply_text(
                         "На этот номер не зарегистрирован аккаунт Telegram. "
@@ -642,26 +666,34 @@ class ControlBot:
                     return
 
             else:
+                logger.info("Вход: проверяю облачный пароль")
                 user = await userbot.check_password(value)
 
         except (PhoneCodeInvalid, PhoneCodeEmpty):
+            logger.warning("Вход: неверный код")
             await message.reply_text("Неверный код, пришли ещё раз. Или /cancel")
             return
         except PhoneCodeExpired:
+            logger.warning(
+                "Вход: код устарел (возможно, Telegram аннулировал его, "
+                "увидев в переписке без пробелов)"
+            )
             self.pending.pop(user_id, None)
             await message.reply_text("Код устарел. Начни заново: /login")
             return
         except PasswordHashInvalid:
+            logger.warning("Вход: неверный облачный пароль")
             await message.reply_text("Неверный пароль, пришли ещё раз. Или /cancel")
             return
         except FloodWait as exc:
+            logger.warning("Вход: FloodWait на %s сек", exc.value)
             self.pending.pop(user_id, None)
             await message.reply_text(
                 f"Telegram просит подождать {exc.value} сек перед новой попыткой"
             )
             return
         except RPCError as exc:
-            logger.warning("Ошибка входа в аккаунт: %s", exc)
+            logger.warning("Вход: ошибка Telegram на шаге %s: %s", step, exc)
             reason = escape(exc.MESSAGE or str(exc))
 
             if step == "phone":
@@ -676,6 +708,7 @@ class ControlBot:
                 )
             return
 
+        logger.info("Вход: успешно, аккаунт id=%s", user.id)
         self.pending.pop(user_id, None)
         self.login_future.set_result(user)
 
