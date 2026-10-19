@@ -3,11 +3,13 @@ import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from hydrogram import Client, filters
+from hydrogram import Client, filters, idle
 from hydrogram.types import Message
 
-from config import API_HASH, API_ID
+from config import ADMIN_IDS, API_HASH, API_ID, BOT_TOKEN
+from control_bot import ControlBot
 from services.llm_service import ask_agent
+from services.settings_service import settings_service
 from services.speech_service import (
     SpeechRecognitionError,
     speech_service,
@@ -76,6 +78,14 @@ async def message_handler(
     message: Message,
 ) -> None:
     try:
+        settings = await settings_service.get()
+
+        if not await settings_service.should_reply(message.chat.id, settings):
+            return
+
+        if message.voice and not settings.voice_enabled:
+            return
+
         user_message = await get_message_text(
             client=client,
             message=message,
@@ -93,9 +103,11 @@ async def message_handler(
         answer = await ask_agent(
             user_message=user_message,
             session_id=str(message.chat.id),
+            system_prompt=settings.system_prompt,
+            temperature=settings.temperature,
         )
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(settings.reply_delay)
         await message.reply_text(answer)
 
     except SpeechRecognitionError as exc:
@@ -114,6 +126,31 @@ async def message_handler(
         )
 
 
+async def main() -> None:
+    await app.start()
+
+    me = await app.get_me()
+    logging.info("Аккаунт запущен: %s, id=%s", me.first_name, me.id)
+
+    control_bot = None
+
+    if BOT_TOKEN:
+        # Владелец аккаунта всегда может управлять ботом.
+        control_bot = ControlBot(userbot=app, admin_ids={me.id, *ADMIN_IDS})
+        await control_bot.start()
+    else:
+        logging.warning(
+            "BOT_TOKEN не задан — бот управления не запущен"
+        )
+
+    await idle()
+
+    if control_bot:
+        await control_bot.stop()
+
+    await app.stop()
+
+
 if __name__ == "__main__":
     logging.info("Запускаю Hydrogram")
-    app.run()
+    app.run(main())

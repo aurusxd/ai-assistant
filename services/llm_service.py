@@ -1,36 +1,13 @@
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import ConfigurableField
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 from langchain_redis import RedisChatMessageHistory
 
 from config import DEEPSEEK_API_KEY, REDIS_URL
+from services.settings_service import HISTORY_PREFIX
 
-SYSTEM_PROMPT = """
-Ты — ассистент для общения с людьми.
-
-Правила общения:
-
-- пиши с маленькой буквы всегда как быдло и короткими сообщениями до 7ми слов
-- учти, твой собеседник женского пола
-- Пиши так, как обычно общается живой человек в переписке.
-- Отвечай естественно, без канцелярита и шаблонных фраз.
-- Учитывай предыдущие сообщения диалога.
-- Не повторяй уже сказанное без необходимости.
-- Поддерживай разговор и развивай тему.
-- Если это уместно, в конце сообщения задай один естественный вопрос, который поможет продолжить диалог.
-- Не используй фразы вроде «чем ещё могу помочь?», если они звучат неестественно.
-- Не начинай каждое сообщение с приветствия, если диалог уже идёт.
-- Используй разговорный язык, но не перегибай со сленгом.
-- Не пиши длинные ответы, если можно ответить короче.
-- Не перечисляй пункты без необходимости — отвечай как в обычном чате.
-- Не придумывай факты. Если чего-то не знаешь, честно скажи об этом.
-- Подстраивайся под стиль собеседника: если он пишет коротко — отвечай коротко; если подробно — можешь отвечать подробнее.
-- Не переигрывай с эмоциями, смайликами и восклицательными знаками.
-- Не используй шаблонные фразы вроде «Спасибо за вопрос», «Отличный вопрос» или «Буду рад помочь», если они не подходят по контексту.
-- Если просят показать лицо - отнекивайся, но не упоминай что ты ии.
-;
-""".strip()
 
 llm = ChatOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -39,12 +16,16 @@ llm = ChatOpenAI(
     temperature=0.7,
     max_retries=2,
     timeout=60,
+).configurable_fields(
+    # Температуру можно менять через бота управления.
+    temperature=ConfigurableField(id="temperature"),
 )
 
 
 prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", SYSTEM_PROMPT),
+        # Промпт хранится в настройках и подставляется при каждом запросе.
+        ("system", "{system_prompt}"),
 
         # Сюда RunnableWithMessageHistory подставит историю из Redis.
         MessagesPlaceholder(variable_name="history"),
@@ -69,7 +50,7 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
     return RedisChatMessageHistory(
         session_id=session_id,
         redis_url=REDIS_URL,
-        key_prefix="assistant:history:",
+        key_prefix=HISTORY_PREFIX,
         ttl=3600, 
     )
 
@@ -89,6 +70,8 @@ chain_with_history = RunnableWithMessageHistory(
 async def ask_agent(
     user_message: str,
     session_id: str,
+    system_prompt: str,
+    temperature: float,
 ) -> str:
     """
     Отправляет сообщение ИИ и сохраняет диалог в Redis.
@@ -99,10 +82,12 @@ async def ask_agent(
     response = await chain_with_history.ainvoke(
         {
             "user_message": user_message.strip(),
+            "system_prompt": system_prompt,
         },
         config={
             "configurable": {
                 "session_id": session_id,
+                "temperature": temperature,
             }
         },
     )
