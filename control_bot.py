@@ -11,6 +11,7 @@ from html import escape
 
 from hydrogram import Client, filters
 from hydrogram.enums import ParseMode
+from hydrogram.errors import MessageNotModified
 from hydrogram.handlers import CallbackQueryHandler, MessageHandler
 from hydrogram.types import (
     CallbackQuery,
@@ -33,9 +34,15 @@ logger = logging.getLogger(__name__)
 
 PROMPT_PREVIEW_LIMIT = 3500
 MAX_PROMPT_LENGTH = 20000
+MAX_REPLY_DELAY = 60
 
 DELAY_PRESETS = (0, 1, 3, 5, 10, 30, 60)
 TEMPERATURE_PRESETS = (0.2, 0.5, 0.7, 1.0, 1.3)
+
+COMMANDS = [
+    "start", "menu", "status", "help", "on", "off", "prompt", "cancel",
+    "reset", "ignore", "allow", "unignore", "disallow",
+]
 
 LISTS = {
     "ignored": (IGNORED_KEY, "Чёрный список"),
@@ -84,7 +91,9 @@ class ControlBot:
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
-            workdir="/app/sessions",
+            # Бот авторизуется по токену при каждом запуске, поэтому смена
+            # BOT_TOKEN сразу подхватывается, а не берётся старая сессия.
+            in_memory=True,
             parse_mode=ParseMode.HTML,
         )
 
@@ -96,6 +105,8 @@ class ControlBot:
         )
         admin_private = filters.private & is_admin
 
+        # Hydrogram вызывает все подходящие обработчики, а не только первый,
+        # поэтому фильтры не должны пересекаться.
         handlers = [
             (self.cmd_menu, filters.command(["start", "menu", "status"])),
             (self.cmd_help, filters.command("help")),
@@ -106,7 +117,10 @@ class ControlBot:
             (self.cmd_reset, filters.command("reset")),
             (self.cmd_list_add, filters.command(["ignore", "allow"])),
             (self.cmd_list_remove, filters.command(["unignore", "disallow"])),
-            (self.on_input, filters.text | filters.document),
+            (
+                self.on_input,
+                (filters.text & ~filters.command(COMMANDS)) | filters.document,
+            ),
         ]
 
         for callback, flt in handlers:
@@ -430,8 +444,10 @@ class ControlBot:
             except ValueError:
                 delay = -1
 
-            if not 0 <= delay <= 600:
-                await message.reply_text("Нужно число от 0 до 600. Или /cancel")
+            if not 0 <= delay <= MAX_REPLY_DELAY:
+                await message.reply_text(
+                    f"Нужно число от 0 до {MAX_REPLY_DELAY}. Или /cancel"
+                )
                 return
 
             self.pending.pop(message.from_user.id, None)
@@ -563,7 +579,9 @@ class ControlBot:
             "prompt": (
                 "✏️ Пришли новый промпт одним сообщением или .txt файлом.\n"
                 "Опиши, как программа должна общаться за тебя: стиль, длина "
-                "сообщений, с кем общается, о чём молчать и т.д."
+                "сообщений, с кем общается, о чём молчать и т.д.\n\n"
+                "Длиннее 4000 символов — только файлом, иначе Telegram "
+                "разрежет сообщение на части."
             ),
             "delay": "Пришли задержку в секундах (например, 4.5)",
             "reset": "Пришли @username или id чата, историю которого сбросить",
@@ -584,10 +602,9 @@ class ControlBot:
 
         try:
             await query.edit_message_text(text, reply_markup=keyboard)
-        except Exception as exc:
+        except MessageNotModified:
             # Telegram ругается, если текст и кнопки не изменились.
-            if "MESSAGE_NOT_MODIFIED" not in str(exc):
-                logger.exception("Не удалось обновить меню")
+            pass
 
         await query.answer(notice)
 

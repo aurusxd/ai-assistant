@@ -28,6 +28,22 @@ app = Client(
 )
 
 
+# Ссылки на фоновые задачи, чтобы сборщик мусора не удалил их раньше времени.
+background_tasks: set[asyncio.Task] = set()
+
+
+async def send_with_delay(
+    message: Message,
+    answer: str,
+    delay: float,
+) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await message.reply_text(answer)
+    except Exception:
+        logging.exception("Ошибка отправки ответа")
+
+
 async def get_message_text(
     client: Client,
     message: Message,
@@ -107,8 +123,13 @@ async def message_handler(
             temperature=settings.temperature,
         )
 
-        await asyncio.sleep(settings.reply_delay)
-        await message.reply_text(answer)
+        # Ждём в фоне, чтобы задержка не занимала воркер Hydrogram
+        # и другие сообщения обрабатывались параллельно.
+        task = asyncio.create_task(
+            send_with_delay(message, answer, settings.reply_delay)
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     except SpeechRecognitionError as exc:
         logging.exception(
@@ -137,7 +158,15 @@ async def main() -> None:
     if BOT_TOKEN:
         # Владелец аккаунта всегда может управлять ботом.
         control_bot = ControlBot(userbot=app, admin_ids={me.id, *ADMIN_IDS})
-        await control_bot.start()
+
+        try:
+            await control_bot.start()
+        except Exception:
+            # Автоответчик должен работать, даже если бот не поднялся.
+            logging.exception(
+                "Не удалось запустить бота управления, проверь BOT_TOKEN"
+            )
+            control_bot = None
     else:
         logging.warning(
             "BOT_TOKEN не задан — бот управления не запущен"
